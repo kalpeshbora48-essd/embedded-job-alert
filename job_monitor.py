@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from ats_sources import fetch_ats_jobs
 
 # ============================================================
 # EMBEDDED JOB RADAR — MULTI SOURCE V1
