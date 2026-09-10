@@ -1,5 +1,3 @@
-
-```yaml
 name: Embedded Job Monitor
 
 on:
@@ -48,4 +46,3 @@ jobs:
             git commit -m "Update seen jobs database"
             git push
           fi
-```
