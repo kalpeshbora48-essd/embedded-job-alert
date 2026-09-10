@@ -1,0 +1,62 @@
+# Semiconductor / Embedded / Electronics
+
+qualcomm.com
+nvidia.com
+intel.com
+amd.com
+nxp.com
+ti.com
+analog.com
+microchip.com
+st.com
+renesas.com
+infineon.com
+mediatek.com
+synaptics.com
+samsung.com
+
+# Industrial / Automation
+
+bosch.com
+continental.com
+harman.com
+siemens.com
+honeywell.com
+schneider-electric.com
+rockwellautomation.com
+abb.com
+johnsoncontrols.com
+
+# Embedded / Engineering Services
+
+tataelxsi.com
+einfochips.com
+moschip.com
+sasken.com
+cyient.com
+kpit.com
+persistent.com
+
+# Indian IT / Engineering
+
+tcs.com
+infosys.com
+wipro.com
+hcltech.com
+techmahindra.com
+ltimindtree.com
+capgemini.com
+accenture.com
+cognizant.com
+
+# Automotive / Electronics / IoT
+
+garmin.com
+tomtom.com
+denso.com
+zebra.com
+aptiv.com
+yazaki.com
+delphi.com
+bharatforge.com
+dixoninfo.com
