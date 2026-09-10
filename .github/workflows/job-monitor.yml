@@ -1,9 +1,9 @@
 name: Embedded Job Monitor
 
-"on":
-  workflow_dispatch:
+on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   monitor:
