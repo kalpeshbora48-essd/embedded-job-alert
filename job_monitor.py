@@ -1,18 +1,21 @@
 import os
 import json
 import hashlib
+import re
 import requests
 import xml.etree.ElementTree as ET
 
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
 
 from ats_sources import fetch_ats_jobs
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -21,48 +24,71 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DB_FILE = Path("seen_jobs.json")
 COMPANIES_FILE = Path("companies.txt")
 
+# Maximum age allowed for a job when a reliable posting date exists.
+# 7 days keeps the alert focused on genuinely fresh jobs.
+MAX_JOB_AGE_DAYS = 7
+
 
 # ============================================================
-# JOB PREFERENCES
+# LOCATIONS
 # ============================================================
 
 LOCATIONS = [
     "pune",
     "pimpri",
+    "pimpri chinchwad",
     "mumbai",
+    "navi mumbai",
+    "thane",
     "bangalore",
     "bengaluru",
     "hyderabad"
 ]
 
 
+# ============================================================
+# EMBEDDED KEYWORDS
+# ============================================================
+
 EMBEDDED_KEYWORDS = [
     "embedded",
     "embedded systems",
     "embedded c",
+    "embedded software",
+    "embedded firmware",
     "firmware",
     "microcontroller",
-    "microcontroller",
+    "microcontrollers",
     "mcu",
     "stm32",
     "arm cortex",
+    "arm",
     "rtos",
     "freertos",
     "iot",
     "electronics",
+    "electronic",
     "hardware",
     "board bring-up",
     "board bringup",
     "device driver",
+    "device drivers",
     "bare metal",
     "bootloader",
     "uart",
     "spi",
     "i2c",
     "can protocol",
-    "can bus"
+    "can bus",
+    "embedded linux",
+    "linux driver",
+    "device firmware"
 ]
 
+
+# ============================================================
+# FRESHER / ENTRY LEVEL
+# ============================================================
 
 FRESHER_KEYWORDS = [
     "fresher",
@@ -71,6 +97,7 @@ FRESHER_KEYWORDS = [
     "recent graduate",
     "entry level",
     "entry-level",
+    "entrylevel",
     "graduate",
     "trainee",
     "intern",
@@ -80,14 +107,20 @@ FRESHER_KEYWORDS = [
     "0 years",
     "0-1 year",
     "0 - 1 year",
+    "0–1 year",
     "0-2 years",
     "0 - 2 years",
+    "0–2 years",
     "0 to 1 year",
     "0 to 2 years",
     "1 year",
     "1 years"
 ]
 
+
+# ============================================================
+# EXPERIENCED / EXCLUDE
+# ============================================================
 
 EXPERIENCED_KEYWORDS = [
     "senior",
@@ -118,118 +151,40 @@ EXPERIENCED_KEYWORDS = [
 
 
 # ============================================================
-# GOOGLE NEWS RSS SOURCES
+# GOOGLE NEWS RSS
 # ============================================================
 
 RSS_FEEDS = [
-
     "https://news.google.com/rss/search?q=embedded+jobs+Pune",
-
     "https://news.google.com/rss/search?q=embedded+jobs+Mumbai",
-
     "https://news.google.com/rss/search?q=embedded+jobs+Bangalore",
-
     "https://news.google.com/rss/search?q=embedded+jobs+Hyderabad",
-
     "https://news.google.com/rss/search?q=firmware+jobs+India",
-
     "https://news.google.com/rss/search?q=embedded+C+jobs+India",
-
     "https://news.google.com/rss/search?q=IoT+jobs+India",
-
     "https://news.google.com/rss/search?q=electronics+jobs+India",
-
     "https://news.google.com/rss/search?q=STM32+jobs+India",
-
     "https://news.google.com/rss/search?q=RTOS+embedded+jobs+India"
 ]
 
 
 # ============================================================
-# TELEGRAM
+# HTTP
 # ============================================================
 
-def send_telegram(message):
-
-    url = (
-        "https://api.telegram.org/bot"
-        + BOT_TOKEN
-        + "/sendMessage"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "Chrome/131.0 Safari/537.36 "
+        "EmbeddedJobMonitor/2.0"
     )
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": False
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=20
-        )
-
-        return response.status_code == 200
-
-    except Exception as error:
-
-        print("Telegram error:", error)
-
-        return False
+}
 
 
 # ============================================================
-# DATABASE
-# ============================================================
-
-def load_seen():
-
-    if not DB_FILE.exists():
-        return set()
-
-    try:
-
-        data = json.loads(
-            DB_FILE.read_text(
-                encoding="utf-8"
-            )
-        )
-
-        return set(data)
-
-    except Exception:
-
-        return set()
-
-
-def save_seen(seen):
-
-    DB_FILE.write_text(
-        json.dumps(
-            sorted(seen),
-            indent=2
-        ),
-        encoding="utf-8"
-    )
-
-
-def job_id(title, link):
-
-    value = (
-        str(title).strip().lower()
-        + "|"
-        + str(link).strip().lower()
-    )
-
-    return hashlib.sha256(
-        value.encode("utf-8")
-    ).hexdigest()
-
-
-# ============================================================
-# TEXT HELPERS
+# TEXT CLEANING
 # ============================================================
 
 def clean_html(text):
@@ -246,20 +201,145 @@ def clean_html(text):
     )
 
 
-def get_domain(url):
+def normalize_text(text):
+
+    text = clean_html(text)
+
+    text = text.lower()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# URL NORMALIZATION
+# ============================================================
+
+def canonical_url(url):
+
+    if not url:
+        return ""
+
+    url = url.strip()
 
     try:
 
-        return urlparse(url).netloc.lower()
+        parsed = urlparse(url)
+
+        if not parsed.scheme:
+            return ""
+
+        host = parsed.netloc.lower()
+
+        if host.startswith("www."):
+            host = host[4:]
+
+        path = parsed.path.rstrip("/")
+
+        # Remove tracking parameters.
+        ignored = {
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_term",
+            "utm_content",
+            "gclid",
+            "fbclid",
+            "ref",
+            "source"
+        }
+
+        query_items = []
+
+        for key, value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True
+        ):
+
+            if key.lower() not in ignored:
+                query_items.append(
+                    (key, value)
+                )
+
+        query = urlencode(
+            query_items
+        )
+
+        return urlunparse(
+            (
+                "https",
+                host,
+                path,
+                "",
+                query,
+                ""
+            )
+        )
 
     except Exception:
 
-        return ""
+        return url
 
+
+# ============================================================
+# URL VALIDATION
+# ============================================================
+
+def is_valid_apply_url(url):
+
+    if not url:
+        return False
+
+    url = canonical_url(url)
+
+    if not url:
+        return False
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {
+        "http",
+        "https"
+    }:
+        return False
+
+    host = parsed.netloc.lower()
+
+    if not host:
+        return False
+
+    # Reject obvious search/discovery pages.
+    bad_paths = [
+        "/careers",
+        "/career",
+        "/jobs",
+        "/job-search",
+        "/search",
+        "/search-jobs",
+        "/jobsearch",
+        "/vacancies"
+    ]
+
+    path = parsed.path.lower().rstrip("/")
+
+    if path in bad_paths:
+        return False
+
+    return True
+
+
+# ============================================================
+# LOCATION
+# ============================================================
 
 def find_location(text):
 
-    text = text.lower()
+    text = normalize_text(text)
 
     for location in LOCATIONS:
 
@@ -269,57 +349,304 @@ def find_location(text):
     return ""
 
 
+# ============================================================
+# SKILLS / EMBEDDED MATCH
+# ============================================================
+
 def embedded_match(text):
 
-    text = text.lower()
+    text = normalize_text(text)
 
     matched = []
 
     for keyword in EMBEDDED_KEYWORDS:
 
-        if keyword.lower() in text:
-
+        if keyword in text:
             matched.append(keyword)
 
-    return matched
+    return list(dict.fromkeys(matched))
 
+
+# ============================================================
+# EXPERIENCE
+# ============================================================
 
 def fresher_status(text):
 
-    text = text.lower()
-
-    matched = []
+    text = normalize_text(text)
 
     for keyword in FRESHER_KEYWORDS:
 
-        if keyword.lower() in text:
-
-            matched.append(keyword)
-
-    if matched:
-        return True
+        if keyword in text:
+            return True
 
     return False
 
 
 def experienced_role(text):
 
-    text = text.lower()
+    text = normalize_text(text)
 
     for keyword in EXPERIENCED_KEYWORDS:
 
-        if keyword.lower() in text:
-
+        if keyword in text:
             return True
 
     return False
 
 
+def extract_experience(text):
+
+    text = normalize_text(text)
+
+    patterns = [
+        r"\b0\s*[-–]\s*1\s*years?\b",
+        r"\b0\s*[-–]\s*2\s*years?\b",
+        r"\b0\s*to\s*1\s*years?\b",
+        r"\b0\s*to\s*2\s*years?\b",
+        r"\b1\s*years?\b",
+        r"\bfresher\b",
+        r"\bfreshers\b",
+        r"\bentry[- ]level\b",
+        r"\bgraduate\b",
+        r"\bintern(ship)?\b",
+        r"\btrainee\b"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            return match.group(0)
+
+    return "Entry level"
+
+
 # ============================================================
-# JOB FILTER
+# SALARY
 # ============================================================
 
-def is_relevant(title, description):
+def extract_salary(text):
+
+    text = clean_html(text)
+
+    patterns = [
+
+        r"(?:₹|rs\.?|inr)\s*[\d,.]+\s*(?:lpa|lakhs?|lakh|cr|crore)?"
+        r"(?:\s*[-–to]+\s*"
+        r"(?:₹|rs\.?|inr)?\s*[\d,.]+\s*(?:lpa|lakhs?|lakh|cr|crore)?)?",
+
+        r"\b\d+(?:\.\d+)?\s*(?:lpa|lakhs?|lakh)\b"
+        r"(?:\s*[-–to]+\s*\d+(?:\.\d+)?\s*(?:lpa|lakhs?|lakh))?",
+
+        r"\$\s*[\d,.]+"
+        r"(?:\s*[-–to]+\s*\$?\s*[\d,.]+)?"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            value = match.group(0).strip()
+
+            if len(value) <= 80:
+                return value
+
+    return ""
+
+
+# ============================================================
+# DATE PARSING
+# ============================================================
+
+def parse_date(value):
+
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # ISO date/time.
+    try:
+
+        iso = text.replace(
+            "Z",
+            "+00:00"
+        )
+
+        dt = datetime.fromisoformat(
+            iso
+        )
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+    except Exception:
+        pass
+
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%d/%m/%Y"
+    ]
+
+    for fmt in formats:
+
+        try:
+
+            dt = datetime.strptime(
+                text,
+                fmt
+            )
+
+            if dt.tzinfo is None:
+
+                dt = dt.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return dt.astimezone(
+                timezone.utc
+            )
+
+        except Exception:
+            continue
+
+    # Relative dates.
+    relative = re.search(
+        r"(\d+)\s*(day|days|hour|hours|week|weeks)\s*ago",
+        text.lower()
+    )
+
+    if relative:
+
+        number = int(
+            relative.group(1)
+        )
+
+        unit = relative.group(2)
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        if "hour" in unit:
+
+            return now - timedelta(
+                hours=number
+            )
+
+        if "day" in unit:
+
+            return now - timedelta(
+                days=number
+            )
+
+        if "week" in unit:
+
+            return now - timedelta(
+                weeks=number
+            )
+
+    if text.lower() in {
+        "today",
+        "just now"
+    }:
+
+        return datetime.now(
+            timezone.utc
+        )
+
+    if text.lower() == "yesterday":
+
+        return (
+            datetime.now(
+                timezone.utc
+            )
+            - timedelta(days=1)
+        )
+
+    return None
+
+
+# ============================================================
+# FRESHNESS
+# ============================================================
+
+def is_recent_job(date_value):
+
+    dt = parse_date(
+        date_value
+    )
+
+    # If source provides no reliable date,
+    # do NOT trust it as a fresh job.
+    if dt is None:
+        return False
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    # Future timestamps are suspicious.
+    if dt > now + timedelta(
+        minutes=10
+    ):
+        return False
+
+    age = now - dt
+
+    if age < timedelta(
+        minutes=-10
+    ):
+        return False
+
+    if age > timedelta(
+        days=MAX_JOB_AGE_DAYS
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
+# RELEVANCE
+# ============================================================
+
+def is_relevant(
+    title,
+    description
+):
 
     title = title or ""
     description = description or ""
@@ -328,69 +655,193 @@ def is_relevant(title, description):
         title
         + " "
         + description
-    ).lower()
+    )
 
-    # --------------------------------------------------------
-    # Embedded-related check
-    # --------------------------------------------------------
-
-    skills = embedded_match(combined)
+    skills = embedded_match(
+        combined
+    )
 
     if not skills:
+
         return (
             False,
             "",
-            False,
-            []
+            "",
+            [],
+            ""
         )
 
-    # --------------------------------------------------------
-    # Location check
-    # --------------------------------------------------------
-
-    location = find_location(combined)
+    location = find_location(
+        combined
+    )
 
     if not location:
 
         return (
             False,
             "",
-            False,
-            skills
+            "",
+            skills,
+            ""
         )
 
-    # --------------------------------------------------------
-    # Experienced-role exclusion
-    # --------------------------------------------------------
-
-    if experienced_role(combined):
+    if experienced_role(
+        title
+    ):
 
         return (
             False,
             location,
-            False,
-            skills
+            "",
+            skills,
+            ""
         )
 
-    # --------------------------------------------------------
-    # Fresher detection
-    # --------------------------------------------------------
+    experience = extract_experience(
+        combined
+    )
 
-    fresher = fresher_status(combined)
+    salary = extract_salary(
+        combined
+    )
 
-    # If experience is not explicitly mentioned,
-    # we still allow the job because many company pages
-    # do not expose experience information.
+    # We want fresher/entry-level roles.
+    # If the description clearly says an experienced
+    # range such as 3+ years, reject it.
+    experience_lower = normalize_text(
+        combined
+    )
+
+    bad_experience_patterns = [
+        r"\b[2-9]\s*\+\s*years?\b",
+        r"\b1[0-9]\s*\+\s*years?\b",
+        r"\b[3-9]\s*years?\s*(?:of)?\s*experience\b",
+        r"\b1[0-9]\s*years?\s*(?:of)?\s*experience\b"
+    ]
+
+    for pattern in bad_experience_patterns:
+
+        if re.search(
+            pattern,
+            experience_lower
+        ):
+
+            return (
+                False,
+                location,
+                experience,
+                skills,
+                salary
+            )
+
     return (
         True,
         location,
-        fresher,
-        skills
+        experience,
+        skills,
+        salary
     )
 
 
 # ============================================================
-# RSS READER
+# DATABASE
+# ============================================================
+
+def load_seen():
+
+    if not DB_FILE.exists():
+        return {}
+
+    try:
+
+        data = json.loads(
+            DB_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if isinstance(data, dict):
+            return data
+
+        if isinstance(data, list):
+
+            return {
+                str(item): {
+                    "sent_at": ""
+                }
+                for item in data
+            }
+
+    except Exception as error:
+
+        print(
+            "Database read error:",
+            error
+        )
+
+    return {}
+
+
+def save_seen(seen):
+
+    DB_FILE.write_text(
+        json.dumps(
+            seen,
+            indent=2,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
+
+# ============================================================
+# DUPLICATE KEY
+# ============================================================
+
+def job_id(
+    title,
+    link,
+    company=""
+):
+
+    normalized_title = normalize_text(
+        title
+    )
+
+    normalized_company = normalize_text(
+        company
+    )
+
+    normalized_link = canonical_url(
+        link
+    )
+
+    # URL is strongest identifier.
+    if normalized_link:
+
+        value = (
+            "url|"
+            + normalized_link
+        )
+
+    else:
+
+        value = (
+            "job|"
+            + normalized_company
+            + "|"
+            + normalized_title
+        )
+
+    return hashlib.sha256(
+        value.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+# ============================================================
+# RSS
 # ============================================================
 
 def read_feed(feed_url):
@@ -401,19 +852,16 @@ def read_feed(feed_url):
 
         response = requests.get(
             feed_url,
-            timeout=20,
-            headers={
-                "User-Agent":
-                "Mozilla/5.0 EmbeddedJobMonitor/1.0"
-            }
+            headers=HEADERS,
+            timeout=20
         )
 
         if response.status_code != 200:
 
             print(
                 "RSS failed:",
-                feed_url,
-                response.status_code
+                response.status_code,
+                feed_url
             )
 
             return jobs
@@ -448,17 +896,20 @@ def read_feed(feed_url):
 
             jobs.append({
 
-                "title": clean_html(title),
+                "title":
+                    clean_html(title),
 
-                "link": link.strip(),
+                "link":
+                    canonical_url(link),
 
                 "description":
                     clean_html(description),
 
-                "date": date,
+                "date":
+                    date,
 
                 "source":
-                    get_domain(link)
+                    "Google News"
 
             })
 
@@ -466,7 +917,6 @@ def read_feed(feed_url):
 
         print(
             "RSS error:",
-            feed_url,
             error
         )
 
@@ -474,7 +924,7 @@ def read_feed(feed_url):
 
 
 # ============================================================
-# COMPANY LIST
+# COMPANIES
 # ============================================================
 
 def load_companies():
@@ -501,50 +951,41 @@ def load_companies():
         if line.startswith("#"):
             continue
 
-        companies.append(line)
+        companies.append(
+            line
+        )
 
     return companies
 
 
 # ============================================================
-# ATS DOMAINS
+# CAREER DISCOVERY
 # ============================================================
 
 ATS_DOMAINS = [
-
     "greenhouse.io",
-
     "lever.co",
-
     "ashbyhq.com",
-
     "smartrecruiters.com",
-
     "recruitee.com",
-
     "breezy.hr",
-
     "teamtailor.com",
-
     "personio.com",
-
     "bamboohr.com",
-
     "workable.com",
-
     "rippling.com"
 ]
 
 
-# ============================================================
-# CAREER LINK DISCOVERY
-# ============================================================
-
-def discover_career_links(domain):
+def discover_career_links(
+    domain
+):
 
     links = set()
 
-    if not domain.startswith("http"):
+    if not domain.startswith(
+        "http"
+    ):
 
         domain = (
             "https://"
@@ -555,20 +996,11 @@ def discover_career_links(domain):
 
         response = requests.get(
             domain,
-            headers={
-                "User-Agent":
-                "Mozilla/5.0 EmbeddedJobMonitor/1.0"
-            },
+            headers=HEADERS,
             timeout=20
         )
 
         if response.status_code != 200:
-
-            print(
-                "Company page failed:",
-                domain,
-                response.status_code
-            )
 
             return []
 
@@ -590,21 +1022,15 @@ def discover_career_links(domain):
             text = anchor.get_text(
                 " ",
                 strip=True
-            ).lower()
+            )
 
             if not href:
                 continue
 
-            # ------------------------------------------------
-            # Convert relative URLs
-            # ------------------------------------------------
-
             if href.startswith("/"):
 
-                base = domain.rstrip("/")
-
                 href = (
-                    base
+                    domain.rstrip("/")
                     + href
                 )
 
@@ -615,15 +1041,11 @@ def discover_career_links(domain):
                     + href
                 )
 
-            # ------------------------------------------------
-            # Career/job links
-            # ------------------------------------------------
-
             combined = (
                 text
                 + " "
-                + href.lower()
-            )
+                + href
+            ).lower()
 
             if any(
                 keyword in combined
@@ -638,32 +1060,33 @@ def discover_career_links(domain):
                 ]
             ):
 
-                links.add(href)
-
-            # ------------------------------------------------
-            # ATS links
-            # ------------------------------------------------
+                links.add(
+                    href
+                )
 
             if any(
                 ats in href.lower()
                 for ats in ATS_DOMAINS
             ):
 
-                links.add(href)
+                links.add(
+                    href
+                )
 
     except Exception as error:
 
         print(
             "Career discovery error:",
-            domain,
             error
         )
 
-    return list(links)
+    return list(
+        links
+    )
 
 
 # ============================================================
-# GENERIC PUBLIC CAREER PAGE READER
+# PUBLIC CAREER PAGE
 # ============================================================
 
 def read_public_career_page(
@@ -677,15 +1100,11 @@ def read_public_career_page(
 
         response = requests.get(
             career_url,
-            headers={
-                "User-Agent":
-                "Mozilla/5.0 EmbeddedJobMonitor/1.0"
-            },
+            headers=HEADERS,
             timeout=20
         )
 
         if response.status_code != 200:
-
             return jobs
 
         soup = BeautifulSoup(
@@ -694,13 +1113,9 @@ def read_public_career_page(
         )
 
         page_text = soup.get_text(
-            "\n",
+            " ",
             strip=True
         )
-
-        # ----------------------------------------------------
-        # Look for links that appear to be job postings
-        # ----------------------------------------------------
 
         for anchor in soup.find_all(
             "a",
@@ -717,35 +1132,7 @@ def read_public_career_page(
                 ""
             ).strip()
 
-            if not title:
-                continue
-
             if len(title) < 5:
-                continue
-
-            combined = (
-                title
-                + " "
-                + href
-            ).lower()
-
-            if not any(
-                keyword in combined
-                for keyword in [
-                    "job",
-                    "career",
-                    "position",
-                    "opening",
-                    "vacancy",
-                    "engineer",
-                    "developer",
-                    "intern",
-                    "trainee",
-                    "firmware",
-                    "embedded"
-                ]
-            ):
-
                 continue
 
             if href.startswith("/"):
@@ -768,22 +1155,48 @@ def read_public_career_page(
                     + href
                 )
 
-            elif not href.startswith(
-                "http"
+            if not is_valid_apply_url(
+                href
+            ):
+                continue
+
+            combined = (
+                title
+                + " "
+                + href
+            ).lower()
+
+            if not any(
+                keyword in combined
+                for keyword in [
+                    "job",
+                    "position",
+                    "opening",
+                    "vacancy",
+                    "engineer",
+                    "developer",
+                    "intern",
+                    "trainee",
+                    "firmware",
+                    "embedded"
+                ]
             ):
 
                 continue
 
             jobs.append({
 
-                "title": title,
+                "title":
+                    title,
 
-                "link": href,
+                "link":
+                    canonical_url(href),
 
                 "description":
                     page_text,
 
-                "date": "",
+                "date":
+                    "",
 
                 "source":
                     company_domain
@@ -794,7 +1207,6 @@ def read_public_career_page(
 
         print(
             "Career page error:",
-            career_url,
             error
         )
 
@@ -802,19 +1214,131 @@ def read_public_career_page(
 
 
 # ============================================================
-# FORMAT TELEGRAM MESSAGE
+# TELEGRAM
 # ============================================================
 
-def format_job(job):
+def send_telegram(
+    message
+):
+
+    url = (
+        "https://api.telegram.org/bot"
+        + BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": False
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=20
+        )
+
+        return (
+            response.status_code == 200
+        )
+
+    except Exception as error:
+
+        print(
+            "Telegram error:",
+            error
+        )
+
+        return False
+
+
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
+
+def format_job(
+    job
+):
 
     title = job.get(
         "title",
         "Unknown role"
     )
 
-    link = job.get(
-        "link",
+    link = canonical_url(
+        job.get(
+            "link",
+            ""
+        )
+    )
+
+    location = job.get(
+        "location",
+        "Not specified"
+    )
+
+    experience = job.get(
+        "experience",
+        "Entry level"
+    )
+
+    salary = job.get(
+        "salary",
         ""
+    )
+
+    message = (
+        "🚨 NEW JOB\n\n"
+        "💼 Role: "
+        + title
+        + "\n"
+        "📍 Location: "
+        + location
+        + "\n"
+        "🎓 Experience: "
+        + experience
+        + "\n"
+    )
+
+    if salary:
+
+        message += (
+            "💰 Salary: "
+            + salary
+            + "\n"
+        )
+
+    message += (
+        "\n🔗 Apply:\n"
+        + link
+    )
+
+    return message
+
+
+# ============================================================
+# PROCESS JOB
+# ============================================================
+
+def process_job(
+    job,
+    seen,
+    new_jobs
+):
+
+    title = job.get(
+        "title",
+        ""
+    ).strip()
+
+    link = canonical_url(
+        job.get(
+            "link",
+            ""
+        )
     )
 
     description = job.get(
@@ -832,83 +1356,96 @@ def format_job(job):
         ""
     )
 
-    location = job.get(
-        "location",
-        ""
-    )
+    if not title:
+        return
 
-    fresher = job.get(
-        "fresher",
-        False
-    )
+    if not is_valid_apply_url(
+        link
+    ):
 
-    skills = job.get(
-        "skills",
-        []
-    )
-
-    if fresher:
-
-        experience_text = (
-            "Fresher / Entry Level"
+        print(
+            "Rejected: invalid apply URL:",
+            title
         )
 
-    else:
+        return
 
-        experience_text = (
-            "Entry-level match"
+    # --------------------------------------------------------
+    # FRESHNESS
+    # --------------------------------------------------------
+
+    if not is_recent_job(
+        date
+    ):
+
+        print(
+            "Rejected: old/unknown date:",
+            title,
+            date
         )
 
-    if not location:
+        return
 
-        location = "Not specified"
+    # --------------------------------------------------------
+    # RELEVANCE
+    # --------------------------------------------------------
 
-    if not source:
-
-        source = "Company / Job Source"
-
-    skill_text = ", ".join(
-        skills[:8]
+    (
+        relevant,
+        location,
+        experience,
+        skills,
+        salary
+    ) = is_relevant(
+        title,
+        description
     )
 
-    message = (
-        "🚨 NEW EMBEDDED JOB\n\n"
+    if not relevant:
 
-        "💼 Role: "
-        + title
-        + "\n\n"
+        return
 
-        "📍 Location: "
-        + location
-        + "\n\n"
+    # --------------------------------------------------------
+    # DUPLICATE
+    # --------------------------------------------------------
 
-        "🎓 Experience: "
-        + experience_text
-        + "\n\n"
-
-        "🛠 Skills: "
-        + skill_text
-        + "\n\n"
-
-        "🏢 Source: "
-        + source
-        + "\n\n"
+    identifier = job_id(
+        title,
+        link
     )
 
-    if date:
+    if identifier in seen:
 
-        message += (
-            "🕒 Posted: "
-            + str(date)
-            + "\n\n"
+        print(
+            "Already sent:",
+            title
         )
 
-    message += (
-        "🔗 APPLY DIRECTLY:\n"
-        + link
-    )
+        return
 
-    return message
+    # --------------------------------------------------------
+    # SAVE DATA
+    # --------------------------------------------------------
+
+    job["title"] = title
+
+    job["link"] = link
+
+    job["location"] = location
+
+    job["experience"] = experience
+
+    job["salary"] = salary
+
+    job["skills"] = skills
+
+    job["source"] = source
+
+    job["_id"] = identifier
+
+    new_jobs.append(
+        job
+    )
 
 
 # ============================================================
@@ -918,15 +1455,15 @@ def format_job(job):
 def main():
 
     print(
-        "\n========================================"
+        "\n======================================"
     )
 
     print(
-        "     EMBEDDED JOB MONITOR"
+        "     EMBEDDED JOB MONITOR v3"
     )
 
     print(
-        "========================================\n"
+        "======================================\n"
     )
 
     seen = load_seen()
@@ -934,7 +1471,7 @@ def main():
     new_jobs = []
 
     # ========================================================
-    # 1. GOOGLE NEWS RSS
+    # RSS SOURCES
     # ========================================================
 
     print(
@@ -954,42 +1491,18 @@ def main():
 
         for job in jobs:
 
-            relevant, location, fresher, skills = is_relevant(
-                job["title"],
-                job["description"]
-            )
-
-            if not relevant:
-                continue
-
-            identifier = job_id(
-                job["title"],
-                job["link"]
-            )
-
-            if identifier in seen:
-                continue
-
-            job["location"] = location
-
-            job["fresher"] = fresher
-
-            job["skills"] = skills
-
-            seen.add(
-                identifier
-            )
-
-            new_jobs.append(
-                job
+            process_job(
+                job,
+                seen,
+                new_jobs
             )
 
     # ========================================================
-    # 2. COMPANY CAREER PAGES + ATS
+    # COMPANY SOURCES
     # ========================================================
 
     print(
-        "\n[2] Checking company career pages..."
+        "\n[2] Checking company sources..."
     )
 
     companies = load_companies()
@@ -997,7 +1510,7 @@ def main():
     for domain in companies:
 
         print(
-            "Discovering:",
+            "\nCompany:",
             domain
         )
 
@@ -1008,13 +1521,8 @@ def main():
         )
 
         # ----------------------------------------------------
-        # DIRECT ATS SOURCES
+        # ATS
         # ----------------------------------------------------
-
-        print(
-            "Checking ATS:",
-            domain
-        )
 
         try:
 
@@ -1024,11 +1532,15 @@ def main():
                 )
             )
 
+            print(
+                "ATS jobs found:",
+                len(ats_jobs)
+            )
+
         except Exception as error:
 
             print(
                 "ATS error:",
-                domain,
                 error
             )
 
@@ -1036,58 +1548,17 @@ def main():
 
         for job in ats_jobs:
 
-            relevant, location, fresher, skills = is_relevant(
-                job.get(
-                    "title",
-                    ""
-                ),
-                job.get(
-                    "description",
-                    ""
-                )
-            )
-
-            if not relevant:
-                continue
-
-            identifier = job_id(
-                job.get(
-                    "title",
-                    ""
-                ),
-                job.get(
-                    "link",
-                    ""
-                )
-            )
-
-            if identifier in seen:
-                continue
-
-            job["location"] = location
-
-            job["fresher"] = fresher
-
-            job["skills"] = skills
-
-            seen.add(
-                identifier
-            )
-
-            new_jobs.append(
-                job
+            process_job(
+                job,
+                seen,
+                new_jobs
             )
 
         # ----------------------------------------------------
-        # NORMAL PUBLIC CAREER PAGES
+        # PUBLIC CAREER PAGES
         # ----------------------------------------------------
 
         for career_url in career_links:
-
-            print(
-                "Reading:",
-                career_url
-            )
 
             jobs = (
                 read_public_career_page(
@@ -1098,64 +1569,47 @@ def main():
 
             for job in jobs:
 
-                relevant, location, fresher, skills = is_relevant(
-                    job["title"],
-                    job["description"]
-                )
-
-                if not relevant:
-                    continue
-
-                identifier = job_id(
-                    job["title"],
-                    job["link"]
-                )
-
-                if identifier in seen:
-                    continue
-
-                job["location"] = location
-
-                job["fresher"] = fresher
-
-                job["skills"] = skills
-
-                seen.add(
-                    identifier
-                )
-
-                new_jobs.append(
-                    job
+                process_job(
+                    job,
+                    seen,
+                    new_jobs
                 )
 
     # ========================================================
-    # SAVE DATABASE
+    # REMOVE DUPLICATES INSIDE THIS RUN
     # ========================================================
 
-    save_seen(
-        seen
-    )
+    unique_jobs = []
 
-    # ========================================================
-    # TELEGRAM ALERTS
-    # ========================================================
+    current_run_ids = set()
+
+    for job in new_jobs:
+
+        identifier = job.get(
+            "_id"
+        )
+
+        if identifier in current_run_ids:
+            continue
+
+        current_run_ids.add(
+            identifier
+        )
+
+        unique_jobs.append(
+            job
+        )
+
+    new_jobs = unique_jobs
 
     print(
-        "\nNew matching jobs:",
+        "\nNew jobs ready:",
         len(new_jobs)
     )
 
-    if not new_jobs:
-
-        print(
-            "No new matching jobs."
-        )
-
-        return
-
-    print(
-        "Sending Telegram alerts..."
-    )
+    # ========================================================
+    # SEND
+    # ========================================================
 
     for job in new_jobs:
 
@@ -1169,8 +1623,32 @@ def main():
 
         if success:
 
+            identifier = job.get(
+                "_id"
+            )
+
+            # Mark as sent ONLY after Telegram succeeds.
+            seen[identifier] = {
+                "title":
+                    job.get(
+                        "title",
+                        ""
+                    ),
+
+                "link":
+                    job.get(
+                        "link",
+                        ""
+                    ),
+
+                "sent_at":
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+            }
+
             print(
-                "Alert sent:",
+                "SENT:",
                 job.get(
                     "title",
                     ""
@@ -1180,15 +1658,28 @@ def main():
         else:
 
             print(
-                "Alert failed:",
+                "TELEGRAM FAILED:",
                 job.get(
                     "title",
                     ""
                 )
             )
 
+    # ========================================================
+    # SAVE
+    # ========================================================
+
+    save_seen(
+        seen
+    )
+
     print(
-        "\nMonitor completed successfully."
+        "\nDatabase entries:",
+        len(seen)
+    )
+
+    print(
+        "Monitor completed."
     )
 
 
