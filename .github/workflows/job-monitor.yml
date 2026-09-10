@@ -1,48 +1,817 @@
-name: Embedded Job Monitor
+import os
+import json
+import hashlib
+import requests
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
-on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+# ============================================================
+# EMBEDDED JOB RADAR
+# ============================================================
 
-permissions:
-  contents: write
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-jobs:
-  monitor:
-    runs-on: ubuntu-latest
+DB_FILE = Path("seen_jobs.json")
+COMPANIES_FILE = Path("companies.txt")
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 EmbeddedJobRadar/1.0"
+}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+# ============================================================
+# LOCATIONS
+# ============================================================
 
-      - name: Install dependencies
-        run: |
-          pip install requests beautifulsoup4
+LOCATIONS = [
+    "pune",
+    "pimpri",
+    "mumbai",
+    "bangalore",
+    "bengaluru",
+    "hyderabad"
+]
 
-      - name: Run job monitor
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python job_monitor.py
+# ============================================================
+# EMBEDDED / ELECTRONICS KEYWORDS
+# ============================================================
 
-      - name: Save seen jobs database
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+EMBEDDED_KEYWORDS = [
+    "embedded",
+    "embedded systems",
+    "embedded system",
+    "embedded c",
+    "embedded software",
+    "embedded engineer",
+    "firmware",
+    "firmware engineer",
+    "microcontroller",
+    "microcontrollers",
+    "mcu",
+    "stm32",
+    "arm cortex",
+    "rtos",
+    "freertos",
+    "iot",
+    "internet of things",
+    "electronics",
+    "hardware",
+    "device driver",
+    "device drivers",
+    "bare metal",
+    "bootloader",
+    "uart",
+    "spi",
+    "i2c",
+    "can bus",
+    "can protocol"
+]
 
-          git add seen_jobs.json
+# ============================================================
+# FRESHER / ENTRY LEVEL KEYWORDS
+# ============================================================
 
-          if git diff --cached --quiet; then
-            echo "No database changes."
-          else
-            git commit -m "Update seen jobs database"
-            git push
-          fi
+FRESHER_KEYWORDS = [
+    "fresher",
+    "freshers",
+    "fresh graduate",
+    "recent graduate",
+    "entry level",
+    "entry-level",
+    "graduate",
+    "trainee",
+    "intern",
+    "internship",
+    "junior",
+    "0 year",
+    "0 years",
+    "0-1 year",
+    "0-2 years",
+    "0 to 1 year",
+    "0 to 2 years",
+    "1 year",
+    "1 years"
+]
+
+# ============================================================
+# EXPERIENCED JOB KEYWORDS
+# ============================================================
+
+EXPERIENCED_KEYWORDS = [
+    "senior",
+    "sr.",
+    "sr ",
+    "lead engineer",
+    "technical lead",
+    "principal engineer",
+    "staff engineer",
+    "architect",
+    "engineering manager",
+    "project manager",
+    "director",
+    "head of",
+    "5+ years",
+    "6+ years",
+    "7+ years",
+    "8+ years",
+    "10+ years"
+]
+
+# ============================================================
+# PUBLIC RSS SOURCES
+# ============================================================
+
+RSS_FEEDS = [
+    "https://news.google.com/rss/search?q=embedded+jobs+Pune+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=embedded+jobs+Mumbai+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=embedded+jobs+Bangalore+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=embedded+jobs+Hyderabad+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=firmware+engineer+India+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=embedded+C+engineer+India+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=IoT+engineer+India+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=electronics+engineer+India+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=STM32+jobs+India+fresher&hl=en-IN&gl=IN&ceid=IN:en",
+
+    "https://news.google.com/rss/search?q=RTOS+embedded+India+fresher&hl=en-IN&gl=IN&ceid=IN:en"
+]
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": False
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def load_seen():
+
+    if not DB_FILE.exists():
+        return set()
+
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as file:
+            return set(json.load(file))
+
+    except Exception:
+        return set()
+
+
+def save_seen(seen):
+
+    with open(DB_FILE, "w", encoding="utf-8") as file:
+        json.dump(
+            sorted(list(seen)),
+            file,
+            indent=2
+        )
+
+
+def job_id(title, link):
+
+    value = (
+        title.strip().lower()
+        + "|"
+        + link.strip().lower()
+    )
+
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+# ============================================================
+# HTML CLEANER
+# ============================================================
+
+def clean_html(text):
+
+    return BeautifulSoup(
+        text or "",
+        "html.parser"
+    ).get_text(
+        " ",
+        strip=True
+    )
+
+
+# ============================================================
+# LOCATION MATCH
+# ============================================================
+
+def find_location(text):
+
+    text = text.lower()
+
+    for location in LOCATIONS:
+
+        if location in text:
+
+            return location.title()
+
+    return None
+
+
+# ============================================================
+# EMBEDDED MATCH
+# ============================================================
+
+def find_embedded_keywords(text):
+
+    text = text.lower()
+
+    return [
+        keyword
+        for keyword in EMBEDDED_KEYWORDS
+        if keyword.lower() in text
+    ]
+
+
+# ============================================================
+# FRESHER CHECK
+# ============================================================
+
+def check_experience(text):
+
+    text = text.lower()
+
+    for keyword in EXPERIENCED_KEYWORDS:
+
+        if keyword.lower() in text:
+
+            return False, "Experienced/Senior"
+
+    for keyword in FRESHER_KEYWORDS:
+
+        if keyword.lower() in text:
+
+            return True, keyword
+
+    return True, "Experience not clearly stated"
+
+
+# ============================================================
+# FINAL JOB FILTER
+# ============================================================
+
+def is_relevant(title, description):
+
+    text = (
+        title
+        + " "
+        + description
+    ).lower()
+
+    embedded_matches = find_embedded_keywords(text)
+
+    if not embedded_matches:
+
+        return (
+            False,
+            None,
+            None,
+            []
+        )
+
+    location = find_location(text)
+
+    if not location:
+
+        return (
+            False,
+            None,
+            None,
+            embedded_matches
+        )
+
+    fresher_ok, fresher_reason = check_experience(text)
+
+    if not fresher_ok:
+
+        return (
+            False,
+            location,
+            fresher_reason,
+            embedded_matches
+        )
+
+    return (
+        True,
+        location,
+        fresher_reason,
+        embedded_matches
+    )
+
+
+# ============================================================
+# READ RSS
+# ============================================================
+
+def read_feed(feed_url):
+
+    jobs = []
+
+    try:
+
+        response = requests.get(
+            feed_url,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        root = ET.fromstring(
+            response.content
+        )
+
+        for item in root.findall(".//item"):
+
+            title = (
+                item.findtext("title")
+                or ""
+            )
+
+            link = (
+                item.findtext("link")
+                or ""
+            )
+
+            description = (
+                item.findtext("description")
+                or ""
+            )
+
+            pub_date = (
+                item.findtext("pubDate")
+                or ""
+            )
+
+            description = clean_html(
+                description
+            )
+
+            if not title or not link:
+                continue
+
+            jobs.append({
+                "title": title.strip(),
+                "link": link.strip(),
+                "description": description.strip(),
+                "date": pub_date.strip(),
+                "source": "Google News / Public Search"
+            })
+
+    except Exception as error:
+
+        print(
+            f"RSS error: {feed_url}"
+        )
+
+        print(error)
+
+    return jobs
+
+
+# ============================================================
+# READ COMPANIES.TXT
+# ============================================================
+
+def load_companies():
+
+    if not COMPANIES_FILE.exists():
+
+        print(
+            "companies.txt not found."
+        )
+
+        return []
+
+    companies = []
+
+    with open(
+        COMPANIES_FILE,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        for line in file:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith("#"):
+                continue
+
+            companies.append(line)
+
+    return companies
+
+
+# ============================================================
+# FIND CAREER PAGES
+# ============================================================
+
+def discover_career_links(domain):
+
+    links = set()
+
+    urls = [
+        f"https://{domain}",
+        f"https://www.{domain}"
+    ]
+
+    for url in urls:
+
+        try:
+
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=20,
+                allow_redirects=True
+            )
+
+            response.raise_for_status()
+
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser"
+            )
+
+            for tag in soup.find_all(
+                "a",
+                href=True
+            ):
+
+                href = tag.get(
+                    "href",
+                    ""
+                ).strip()
+
+                text = tag.get_text(
+                    " ",
+                    strip=True
+                ).lower()
+
+                combined = (
+                    text
+                    + " "
+                    + href.lower()
+                )
+
+                career_words = [
+                    "career",
+                    "careers",
+                    "jobs",
+                    "job opportunities",
+                    "work with us",
+                    "join us",
+                    "vacancies"
+                ]
+
+                if any(
+                    word in combined
+                    for word in career_words
+                ):
+
+                    full_url = requests.compat.urljoin(
+                        response.url,
+                        href
+                    )
+
+                    links.add(full_url)
+
+        except Exception as error:
+
+            print(
+                f"Company error: {domain}"
+            )
+
+            print(error)
+
+    return list(links)
+
+
+# ============================================================
+# READ PUBLIC CAREER PAGE
+# ============================================================
+
+def read_career_page(
+    career_url,
+    company_domain
+):
+
+    jobs = []
+
+    try:
+
+        response = requests.get(
+            career_url,
+            headers=HEADERS,
+            timeout=30,
+            allow_redirects=True
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        page_text = soup.get_text(
+            " ",
+            strip=True
+        )
+
+        for tag in soup.find_all(
+            "a",
+            href=True
+        ):
+
+            title = tag.get_text(
+                " ",
+                strip=True
+            )
+
+            href = requests.compat.urljoin(
+                response.url,
+                tag["href"]
+            )
+
+            if not title:
+                continue
+
+            if len(title) < 4:
+                continue
+
+            matches = find_embedded_keywords(
+                title
+                + " "
+                + page_text[:5000]
+            )
+
+            if not matches:
+                continue
+
+            jobs.append({
+                "title": title,
+                "link": href,
+                "description": page_text[:3000],
+                "date": "",
+                "source": (
+                    "Company Career Page - "
+                    + company_domain
+                )
+            })
+
+    except Exception as error:
+
+        print(
+            f"Career page error: {career_url}"
+        )
+
+        print(error)
+
+    return jobs
+
+
+# ============================================================
+# PROCESS JOB
+# ============================================================
+
+def process_job(
+    job,
+    seen,
+    new_jobs
+):
+
+    title = job.get(
+        "title",
+        ""
+    )
+
+    link = job.get(
+        "link",
+        ""
+    )
+
+    description = job.get(
+        "description",
+        ""
+    )
+
+    if not title or not link:
+        return
+
+    relevant, location, fresher, skills = is_relevant(
+        title,
+        description
+    )
+
+    if not relevant:
+        return
+
+    identifier = job_id(
+        title,
+        link
+    )
+
+    if identifier in seen:
+        return
+
+    seen.add(identifier)
+
+    job["location"] = location
+    job["fresher"] = fresher
+    job["skills"] = skills
+
+    new_jobs.append(job)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "======================================"
+    )
+
+    print(
+        "       EMBEDDED JOB RADAR"
+    )
+
+    print(
+        "======================================"
+    )
+
+    seen = load_seen()
+
+    new_jobs = []
+
+    # --------------------------------------------------------
+    # RSS
+    # --------------------------------------------------------
+
+    print(
+        "\n[1] Checking public search feeds..."
+    )
+
+    for feed in RSS_FEEDS:
+
+        print(
+            "Checking:",
+            feed
+        )
+
+        jobs = read_feed(feed)
+
+        for job in jobs:
+
+            process_job(
+                job,
+                seen,
+                new_jobs
+            )
+
+    # --------------------------------------------------------
+    # COMPANIES
+    # --------------------------------------------------------
+
+    print(
+        "\n[2] Checking company career pages..."
+    )
+
+    companies = load_companies()
+
+    print(
+        f"Companies loaded: {len(companies)}"
+    )
+
+    for domain in companies:
+
+        print(
+            "Checking company:",
+            domain
+        )
+
+        career_links = discover_career_links(
+            domain
+        )
+
+        for career_url in career_links:
+
+            jobs = read_career_page(
+                career_url,
+                domain
+            )
+
+            for job in jobs:
+
+                process_job(
+                    job,
+                    seen,
+                    new_jobs
+                )
+
+    # --------------------------------------------------------
+    # SAVE DATABASE
+    # --------------------------------------------------------
+
+    save_seen(seen)
+
+    print(
+        "\nNew matching jobs:",
+        len(new_jobs)
+    )
+
+    # --------------------------------------------------------
+    # TELEGRAM ALERTS
+    # --------------------------------------------------------
+
+    for job in new_jobs:
+
+        skills = ", ".join(
+            job.get(
+                "skills",
+                []
+            )[:8]
+        )
+
+        message = (
+            "🚨 NEW EMBEDDED JOB\n\n"
+            f"💼 {job['title']}\n\n"
+            f"🏢 Source: {job['source']}\n"
+            f"📍 Location: {job.get('location', 'Unknown')}\n"
+            f"🎓 Experience: {job.get('fresher', 'Check listing')}\n"
+            f"🕐 Posted: {job.get('date', 'Not stated')}\n\n"
+            f"🔧 Skills: {skills}\n\n"
+            f"🔗 APPLY / VIEW:\n"
+            f"{job['link']}\n\n"
+            "🎯 Embedded-related opportunity"
+        )
+
+        try:
+
+            send_telegram(
+                message
+            )
+
+            print(
+                "Telegram alert sent:",
+                job["title"]
+            )
+
+        except Exception as error:
+
+            print(
+                "Telegram error:",
+                error
+            )
+
+    print(
+        "\n======================================"
+    )
+
+    print(
+        "Job Radar finished."
+    )
+
+    print(
+        "======================================"
+    )
+
+
+if __name__ == "__main__":
+    main()
